@@ -1,29 +1,32 @@
 # =============================================================================
-# ProRes 权重代下工作流  （v2）
+# ProRes 权重代下工作流  （v3）
 #
-# v2 修了什么：v1 用 `gdown --id xxx`，但新版 gdown 已删除 --id 参数，
-#   文件 id 改成位置参数，于是四次尝试全在参数解析阶段就退出，
-#   日志报 "gdown: error: unrecognized arguments: --id"。
-#   v2 改成 `gdown <id> -O out.pth`，并加了一条直链兜底。
+# 版本历史
+#   v1  gdown --id 报错（新版 gdown 删了这个参数）
+#   v2  改成位置参数 gdown <id>，跑通了。但发现官方 checkpoint 有 4.45 GB，
+#       因为里面除了 model 权重还存了 optimizer / lr_scheduler，
+#       而推理只需要 checkpoint['model']（约 1.4 GB）。
+#   v3  增加一步自动瘦身：只导出 {'model': state_dict}，让你少下 3 GB。
+#       若识别不出结构，会自动退回原始完整文件，不会失败。
 #
-# 更新方法（仓库里已经有这个文件了，不用新建）：
+# 更新方法（仓库里已有该文件，不用新建）
 #   1. 打开 https://github.com/mo-qing-qing/prores-ckpt/blob/main/.github/workflows/fetch.yml
-#   2. 点右上角铅笔图标进入编辑
-#   3. 编辑器里 Ctrl+A 全选，Delete 清空
-#   4. 复制本文件全部内容，粘贴进去
+#   2. 点右上角铅笔图标
+#   3. Ctrl+A 全选，Delete 清空
+#   4. 复制本文件全部内容，粘贴
 #   5. 右上角 Commit changes -> 弹窗里再点 Commit changes
-#   6. 回到 Actions -> fetch-prores-ckpt -> Run workflow -> 绿色按钮
+#   6. Actions -> fetch-prores-ckpt -> Run workflow -> 绿色按钮
 #
-# 粘贴前请确认浏览器的翻译插件是关闭状态（v1 提交失败就是翻译插件造成的）。
-# 本文件的中文说明全部是 # 注释，整段复制不影响运行。
+# 粘贴前确认浏览器翻译插件是关闭状态。
+# 本文件中文说明全是 # 注释，整段复制不影响运行。
 # =============================================================================
 
 name: fetch-prores-ckpt
 
-# Purpose: this machine cannot reach Google Drive at all (TCP-level block,
-# verified with --resolve against real IPs). GitHub runners run outside the
-# firewall, so let a runner download the Drive file, split it into chunks,
-# and publish the chunks as Release assets. Then download from Release.
+# Purpose: this machine cannot reach Google Drive (TCP-level block, verified by
+# connecting to the real IPs). GitHub runners run outside the firewall, so let a
+# runner download the Drive file, strip the optimizer state, split into chunks,
+# and publish the chunks as Release assets.
 
 on:
   workflow_dispatch:
@@ -93,15 +96,68 @@ jobs:
           echo "RAW_MD5=$MD5" >> "$GITHUB_ENV"
           echo "downloaded $SIZE bytes, md5=$MD5"
 
-      - name: Verify it is a torch archive
+      - name: Slim checkpoint to model weights only
         run: |
-          python -c "import zipfile,sys; ok=zipfile.is_zipfile('ckpt_raw.pth'); print('is_zipfile',ok); sys.exit(0 if ok else 1)"
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu || true
+          cat > slim.py <<'PY'
+          import torch
+          try:
+              ck = torch.load('ckpt_raw.pth', map_location='cpu')
+          except Exception as e:
+              print('load failed:', e)
+              raise SystemExit(0)
+          print('top-level type:', type(ck).__name__)
+          if isinstance(ck, dict):
+              for k, v in ck.items():
+                  if isinstance(v, dict):
+                      print('  key:', k, '-> dict with', len(v), 'entries')
+                  elif isinstance(v, (int, float, str)):
+                      print('  key:', k, '->', v)
+                  else:
+                      print('  key:', k, '->', type(v).__name__)
+          sd = None
+          if isinstance(ck, dict):
+              for key in ('model', 'state_dict', 'model_state_dict'):
+                  if key in ck and isinstance(ck[key], dict):
+                      sd = ck[key]
+                      print('selected key:', key, 'tensors:', len(sd))
+                      break
+              if sd is None and ck and all(torch.is_tensor(v) for v in ck.values()):
+                  sd = ck
+                  print('checkpoint is already a raw state_dict')
+          if sd is None:
+              print('no model weights found, will keep the original file')
+              raise SystemExit(0)
+          total = sum(t.numel() * t.element_size() for t in sd.values() if torch.is_tensor(t))
+          print('model-only payload: %.2f GB' % (total / 1e9))
+          torch.save({'model': sd}, 'ckpt_model_only.pth')
+          PY
+          python slim.py || true
+          ls -lh ckpt_raw.pth ckpt_model_only.pth 2>/dev/null || true
+
+      - name: Pick the smaller usable file
+        run: |
+          SRC=ckpt_raw.pth
+          if [ -f ckpt_model_only.pth ] && [ "$(stat -c%s ckpt_model_only.pth)" -gt 100000000 ]; then
+            SRC=ckpt_model_only.pth
+            echo "using slimmed model-only checkpoint"
+          else
+            echo "using the original full checkpoint"
+          fi
+          cp "$SRC" final.pth
+          ls -lh final.pth
+          echo "FINAL_BYTES=$(stat -c%s final.pth)" >> "$GITHUB_ENV"
+          echo "FINAL_SRC=$SRC" >> "$GITHUB_ENV"
+
+      - name: Verify final file is a torch archive
+        run: |
+          python -c "import zipfile,sys; ok=zipfile.is_zipfile('final.pth'); print('is_zipfile',ok); sys.exit(0 if ok else 1)"
 
       - name: Split into chunks
         run: |
-          split -b "${{ inputs.part_mb }}M" -d -a 2 ckpt_raw.pth ckpt.pth.part
+          split -b "${{ inputs.part_mb }}M" -d -a 2 final.pth ckpt.pth.part
           ls -lh ckpt.pth.part*
-          md5sum ckpt.pth.part* | tee parts_md5.txt
+          md5sum final.pth ckpt.pth.part* | tee parts_md5.txt
 
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
@@ -109,9 +165,13 @@ jobs:
           tag_name: ckpt-${{ github.run_number }}
           name: ProRes checkpoint run ${{ github.run_number }}
           body: |
-            raw size : ${{ env.SIZE_BYTES }} bytes
-            raw md5  : ${{ env.RAW_MD5 }}
-            merge    : cat ckpt.pth.part* > checkpoint-49.pth
+            source file : ${{ env.FINAL_SRC }}
+            final size  : ${{ env.FINAL_BYTES }} bytes
+            raw md5     : ${{ env.RAW_MD5 }}
+            merge       : cat ckpt.pth.part* > checkpoint-49.pth
+            note        : if source file says ckpt_model_only.pth, this archive holds
+                          {"model": state_dict} only, which is exactly what the
+                          official demo scripts load via checkpoint['model'].
           files: |
             ckpt.pth.part*
             parts_md5.txt
@@ -121,22 +181,22 @@ jobs:
 # =============================================================================
 # 跑完之后
 #
-#   Release 页面出现 ckpt.pth.part00 / part01 / part02（1.5G 分三卷）
+#   新的 Release（ckpt-3）里应该是 2 个分卷、合计约 1.4 GB，
+#   而不是上一轮的 7 个、4.45 GB。Release 页面会写
+#   "source file : ckpt_model_only.pth"，那就对了。
+#
 #   直连慢就拼加速前缀（实测可用）：
 #       https://ghfast.top/ + 原来的完整链接
-#   三个文件全部丢进：
+#
+#   分卷全部丢进：
 #       E:\lunwen\图像复原\11_统一复原专题\03_代码\ProRes-main\ProRes\_ckpt_parts\
 #   然后 cd ProRes && python join_ckpt.py
 #
-# 这次的日志怎么看
-#   正常应该是：
-#       gdown version: 5.x.x
-#       === gdown attempt 1 ===
-#       ... Downloading ...
-#       after gdown: ok=1 size=1500000000 左右
-#   如果看到 "fallback: direct usercontent link"，说明 gdown 还是不行、
-#   走了兜底直链，只要 fallback size 足够大也算成功。
+# 日志里重点看这三行
+#   "downloaded NNN bytes"            下载成功，NNN 应在 4.4e9 量级
+#   "model-only payload: X.XX GB"     瘦身成功，应在 1.4 左右
+#   "using slimmed model-only checkpoint"
 #
-#   如果两条都失败，现在会直接 exit 1 并打印真实错误，
-#   不会再拿"配额"这种猜的文案误导。
+#   若出现 "using the original full checkpoint"，说明结构没识别出来，
+#   会退回完整文件（仍然可用，只是要下 4.45 GB）。
 # =============================================================================
