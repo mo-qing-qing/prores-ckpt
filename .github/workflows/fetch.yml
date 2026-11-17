@@ -1,33 +1,29 @@
 # =============================================================================
-# ProRes 权重代下工作流
+# ProRes 权重代下工作流  （v2）
 #
-# 用法（三分钟）：
-#   1. 这个文件整段复制（Ctrl+A 再 Ctrl+C），不要去挑，全选就行。
-#      说明文字都是 # 开头的注释，一起复制也不影响运行。
-#   2. 浏览器开 https://github.com/new
-#        Repository name 填 prores-ckpt
-#        选 Public（重要，理由见下）
-#        勾 Add a README file
-#        Create repository
-#   3. 进仓库点 Add file -> Create new file
-#        文件名框输入：.github/workflows/fetch.yml
-#        （输入斜杠时会自动建目录，不用手动建文件夹）
-#        大文本框里粘贴，点 Commit changes
-#   4. 点顶部 Actions -> 左侧 fetch-prores-ckpt -> 右侧 Run workflow -> 绿按钮
-#   5. 等 5 到 15 分钟，绿勾出现后去仓库首页右侧 Releases 下载 ckpt.pth.part00 等
+# v2 修了什么：v1 用 `gdown --id xxx`，但新版 gdown 已删除 --id 参数，
+#   文件 id 改成位置参数，于是四次尝试全在参数解析阶段就退出，
+#   日志报 "gdown: error: unrecognized arguments: --id"。
+#   v2 改成 `gdown <id> -O out.pth`，并加了一条直链兜底。
 #
-# 为什么要选 Public 而不是 Private：
-#   GitHub 免费账号的私有仓库，Actions 产物存储只有 500 MB，而权重有 1.5 GB，
-#   会直接超额度失败。公开仓库的 Release 不占这个额度。
-#   另外公开仓库的下载链接才能走国内加速站（后面会给你），私有仓库的链接
-#   加速站拿不到授权，下载会非常慢。
-#   这只是个临时中转仓库，跑完删掉就行。
+# 更新方法（仓库里已经有这个文件了，不用新建）：
+#   1. 打开 https://github.com/mo-qing-qing/prores-ckpt/blob/main/.github/workflows/fetch.yml
+#   2. 点右上角铅笔图标进入编辑
+#   3. 编辑器里 Ctrl+A 全选，Delete 清空
+#   4. 复制本文件全部内容，粘贴进去
+#   5. 右上角 Commit changes -> 弹窗里再点 Commit changes
+#   6. 回到 Actions -> fetch-prores-ckpt -> Run workflow -> 绿色按钮
 #
-# 原理：本机到 Google 的 TCP 完全不通（用真实 IP 直连也是 HTTP 000），
-#       GitHub 的服务器在墙外，能访问 Google Drive，所以让它替我们下。
+# 粘贴前请确认浏览器的翻译插件是关闭状态（v1 提交失败就是翻译插件造成的）。
+# 本文件的中文说明全部是 # 注释，整段复制不影响运行。
 # =============================================================================
 
 name: fetch-prores-ckpt
+
+# Purpose: this machine cannot reach Google Drive at all (TCP-level block,
+# verified with --resolve against real IPs). GitHub runners run outside the
+# firewall, so let a runner download the Drive file, split it into chunks,
+# and publish the chunks as Release assets. Then download from Release.
 
 on:
   workflow_dispatch:
@@ -54,30 +50,48 @@ jobs:
 
       - name: Download from Google Drive
         run: |
+          FID="${{ inputs.file_id }}"
+          echo "gdown version:"; gdown --version || true
+          # NOTE: recent gdown removed --id; the file id is a positional argument now.
           ok=0
-          for i in 1 2 3 4; do
-            echo "=== attempt $i ==="
-            if gdown --id "${{ inputs.file_id }}" -O ckpt_raw.pth --continue; then
+          for i in 1 2 3; do
+            echo "=== gdown attempt $i ==="
+            if gdown "$FID" -O ckpt_raw.pth --continue --retries 5; then
               ok=1
               break
             fi
-            sleep 20
+            sleep 10
           done
-          if [ "$ok" != "1" ]; then
-            echo "::error::gdown failed after 4 attempts. Most likely the Google Drive daily quota for this file. Wait 24h and rerun, or pass another file_id."
+          SIZE=0
+          if [ -f ckpt_raw.pth ]; then SIZE=$(stat -c%s ckpt_raw.pth); fi
+          echo "after gdown: ok=$ok size=$SIZE"
+
+          if [ "$SIZE" -lt 100000000 ]; then
+            echo "=== fallback: direct usercontent link ==="
+            rm -f ckpt_alt.pth
+            curl -L -sS --retry 5 --retry-delay 10 --retry-all-errors \
+              "https://drive.usercontent.google.com/download?id=${FID}&export=download&confirm=t" \
+              -o ckpt_alt.pth -w "http=%{http_code}\n" || true
+            if [ -f ckpt_alt.pth ]; then
+              ASIZE=$(stat -c%s ckpt_alt.pth)
+              echo "fallback size=$ASIZE"
+              if [ "$ASIZE" -gt 100000000 ]; then
+                mv ckpt_alt.pth ckpt_raw.pth
+                SIZE=$ASIZE
+              else
+                echo "fallback head:"; head -c 400 ckpt_alt.pth; echo
+              fi
+            fi
+          fi
+
+          if [ "$SIZE" -lt 100000000 ]; then
+            echo "::error::both gdown and direct link failed, final size=$SIZE. See the log above for the exact error."
             exit 1
           fi
-          ls -lh ckpt_raw.pth
-          SIZE=$(stat -c%s ckpt_raw.pth)
           MD5=$(md5sum ckpt_raw.pth | awk '{print $1}')
           echo "SIZE_BYTES=$SIZE" >> "$GITHUB_ENV"
           echo "RAW_MD5=$MD5" >> "$GITHUB_ENV"
           echo "downloaded $SIZE bytes, md5=$MD5"
-          if [ "$SIZE" -lt 100000000 ]; then
-            echo "::error::file is only $SIZE bytes, this is not the checkpoint"
-            head -c 500 ckpt_raw.pth
-            exit 1
-          fi
 
       - name: Verify it is a torch archive
         run: |
@@ -107,23 +121,22 @@ jobs:
 # =============================================================================
 # 跑完之后
 #
-#   Release 页面会出现 ckpt.pth.part00 / part01 / part02（1.5G 分三卷）
-#   下载时如果直连很慢，把链接前面拼上加速前缀，实测可用：
+#   Release 页面出现 ckpt.pth.part00 / part01 / part02（1.5G 分三卷）
+#   直连慢就拼加速前缀（实测可用）：
 #       https://ghfast.top/ + 原来的完整链接
-#   示例：
-#       https://ghfast.top/https://github.com/你的用户名/prores-ckpt/releases/download/ckpt-1/ckpt.pth.part00
-#
 #   三个文件全部丢进：
 #       E:\lunwen\图像复原\11_统一复原专题\03_代码\ProRes-main\ProRes\_ckpt_parts\
+#   然后 cd ProRes && python join_ckpt.py
 #
-#   然后告诉我，我合并校验。你也可以自己跑：
-#       cd ProRes && python join_ckpt.py
+# 这次的日志怎么看
+#   正常应该是：
+#       gdown version: 5.x.x
+#       === gdown attempt 1 ===
+#       ... Downloading ...
+#       after gdown: ok=1 size=1500000000 左右
+#   如果看到 "fallback: direct usercontent link"，说明 gdown 还是不行、
+#   走了兜底直链，只要 fallback size 足够大也算成功。
 #
-# 常见失败
-#   Run workflow 按钮不出现      -> 左侧列表里点一下 fetch-prores-ckpt，再刷新
-#   下载那步红叉，日志里 too many users
-#                                -> 这个 Drive 文件当天被下太多次，隔 24 小时重跑
-#   Publish to Release 红叉      -> Settings -> Actions -> General ->
-#                                   Workflow permissions 选 Read and write，
-#                                   再 Save，然后重新 Run workflow
+#   如果两条都失败，现在会直接 exit 1 并打印真实错误，
+#   不会再拿"配额"这种猜的文案误导。
 # =============================================================================
