@@ -1,0 +1,129 @@
+# =============================================================================
+# ProRes 权重代下工作流
+#
+# 用法（三分钟）：
+#   1. 这个文件整段复制（Ctrl+A 再 Ctrl+C），不要去挑，全选就行。
+#      说明文字都是 # 开头的注释，一起复制也不影响运行。
+#   2. 浏览器开 https://github.com/new
+#        Repository name 填 prores-ckpt
+#        选 Public（重要，理由见下）
+#        勾 Add a README file
+#        Create repository
+#   3. 进仓库点 Add file -> Create new file
+#        文件名框输入：.github/workflows/fetch.yml
+#        （输入斜杠时会自动建目录，不用手动建文件夹）
+#        大文本框里粘贴，点 Commit changes
+#   4. 点顶部 Actions -> 左侧 fetch-prores-ckpt -> 右侧 Run workflow -> 绿按钮
+#   5. 等 5 到 15 分钟，绿勾出现后去仓库首页右侧 Releases 下载 ckpt.pth.part00 等
+#
+# 为什么要选 Public 而不是 Private：
+#   GitHub 免费账号的私有仓库，Actions 产物存储只有 500 MB，而权重有 1.5 GB，
+#   会直接超额度失败。公开仓库的 Release 不占这个额度。
+#   另外公开仓库的下载链接才能走国内加速站（后面会给你），私有仓库的链接
+#   加速站拿不到授权，下载会非常慢。
+#   这只是个临时中转仓库，跑完删掉就行。
+#
+# 原理：本机到 Google 的 TCP 完全不通（用真实 IP 直连也是 HTTP 000），
+#       GitHub 的服务器在墙外，能访问 Google Drive，所以让它替我们下。
+# =============================================================================
+
+name: fetch-prores-ckpt
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_id:
+        description: "Google Drive file id (default is the ProRes ViT-L checkpoint)"
+        required: false
+        default: "1P-MGgYtXJR214rBCD_LNZYrfQwDbSWGJ"
+      part_mb:
+        description: "chunk size in MB (GitHub allows 2GB per Release asset)"
+        required: false
+        default: "700"
+
+permissions:
+  contents: write   # a fresh repo token is read-only by default; Release needs write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Install gdown
+        run: pip install --quiet --upgrade gdown
+
+      - name: Download from Google Drive
+        run: |
+          ok=0
+          for i in 1 2 3 4; do
+            echo "=== attempt $i ==="
+            if gdown --id "${{ inputs.file_id }}" -O ckpt_raw.pth --continue; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::gdown failed after 4 attempts. Most likely the Google Drive daily quota for this file. Wait 24h and rerun, or pass another file_id."
+            exit 1
+          fi
+          ls -lh ckpt_raw.pth
+          SIZE=$(stat -c%s ckpt_raw.pth)
+          MD5=$(md5sum ckpt_raw.pth | awk '{print $1}')
+          echo "SIZE_BYTES=$SIZE" >> "$GITHUB_ENV"
+          echo "RAW_MD5=$MD5" >> "$GITHUB_ENV"
+          echo "downloaded $SIZE bytes, md5=$MD5"
+          if [ "$SIZE" -lt 100000000 ]; then
+            echo "::error::file is only $SIZE bytes, this is not the checkpoint"
+            head -c 500 ckpt_raw.pth
+            exit 1
+          fi
+
+      - name: Verify it is a torch archive
+        run: |
+          python -c "import zipfile,sys; ok=zipfile.is_zipfile('ckpt_raw.pth'); print('is_zipfile',ok); sys.exit(0 if ok else 1)"
+
+      - name: Split into chunks
+        run: |
+          split -b "${{ inputs.part_mb }}M" -d -a 2 ckpt_raw.pth ckpt.pth.part
+          ls -lh ckpt.pth.part*
+          md5sum ckpt.pth.part* | tee parts_md5.txt
+
+      - name: Publish to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ckpt-${{ github.run_number }}
+          name: ProRes checkpoint run ${{ github.run_number }}
+          body: |
+            raw size : ${{ env.SIZE_BYTES }} bytes
+            raw md5  : ${{ env.RAW_MD5 }}
+            merge    : cat ckpt.pth.part* > checkpoint-49.pth
+          files: |
+            ckpt.pth.part*
+            parts_md5.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# =============================================================================
+# 跑完之后
+#
+#   Release 页面会出现 ckpt.pth.part00 / part01 / part02（1.5G 分三卷）
+#   下载时如果直连很慢，把链接前面拼上加速前缀，实测可用：
+#       https://ghfast.top/ + 原来的完整链接
+#   示例：
+#       https://ghfast.top/https://github.com/你的用户名/prores-ckpt/releases/download/ckpt-1/ckpt.pth.part00
+#
+#   三个文件全部丢进：
+#       E:\lunwen\图像复原\11_统一复原专题\03_代码\ProRes-main\ProRes\_ckpt_parts\
+#
+#   然后告诉我，我合并校验。你也可以自己跑：
+#       cd ProRes && python join_ckpt.py
+#
+# 常见失败
+#   Run workflow 按钮不出现      -> 左侧列表里点一下 fetch-prores-ckpt，再刷新
+#   下载那步红叉，日志里 too many users
+#                                -> 这个 Drive 文件当天被下太多次，隔 24 小时重跑
+#   Publish to Release 红叉      -> Settings -> Actions -> General ->
+#                                   Workflow permissions 选 Read and write，
+#                                   再 Save，然后重新 Run workflow
+# =============================================================================
