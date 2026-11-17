@@ -1,15 +1,16 @@
 # =============================================================================
-# ProRes 权重代下工作流  （v3）
+# ProRes 权重代下工作流  （v4）
 #
 # 版本历史
 #   v1  gdown --id 报错（新版 gdown 删了这个参数）
-#   v2  改成位置参数 gdown <id>，跑通了。但发现官方 checkpoint 有 4.45 GB，
-#       因为里面除了 model 权重还存了 optimizer / lr_scheduler，
-#       而推理只需要 checkpoint['model']（约 1.4 GB）。
-#   v3  增加一步自动瘦身：只导出 {'model': state_dict}，让你少下 3 GB。
-#       若识别不出结构，会自动退回原始完整文件，不会失败。
+#   v2  改成位置参数 gdown <id>，下载成功。但官方 checkpoint 有 4.45 GB，
+#       因为除了 model 权重还存了 optimizer / lr_scheduler，推理只用 model（约 1.4 GB）。
+#   v3  加了自动瘦身，但静默失败退回了原始文件：torch 2.6 起 torch.load 默认
+#       weights_only=True，会拒绝带优化器对象的训练 checkpoint。
+#   v4  显式 weights_only=False（并对老版本 torch 做 TypeError 兜底），
+#       同时把 slim 日志写进 Release 说明，失败也能直接看到原因。
 #
-# 更新方法（仓库里已有该文件，不用新建）
+# 更新方法（仓库里已有该文件）
 #   1. 打开 https://github.com/mo-qing-qing/prores-ckpt/blob/main/.github/workflows/fetch.yml
 #   2. 点右上角铅笔图标
 #   3. Ctrl+A 全选，Delete 清空
@@ -23,10 +24,13 @@
 
 name: fetch-prores-ckpt
 
-# Purpose: this machine cannot reach Google Drive (TCP-level block, verified by
-# connecting to the real IPs). GitHub runners run outside the firewall, so let a
-# runner download the Drive file, strip the optimizer state, split into chunks,
-# and publish the chunks as Release assets.
+# Purpose: this machine cannot reach Google Drive at all (TCP-level block,
+# verified with --resolve against real IPs). GitHub runners run outside the
+# firewall, so let a runner download the Drive file, split it into chunks,
+# and publish the chunks as Release assets. Then download from Release.
+#
+# Keep every line in this file ASCII-only to avoid encoding damage when the
+# content is pasted through a browser textarea.
 
 on:
   workflow_dispatch:
@@ -98,14 +102,23 @@ jobs:
 
       - name: Slim checkpoint to model weights only
         run: |
-          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu || true
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu > pip.log 2>&1
+          echo "pip exit code: $?"
+          tail -n 5 pip.log
+          python -c "import torch; print('torch', torch.__version__)" 2>&1 | tail -n 3
           cat > slim.py <<'PY'
+          import sys
           import torch
+          path = 'ckpt_raw.pth'
+          # torch 2.6+ defaults to weights_only=True, which rejects training
+          # checkpoints that carry optimizer / scheduler objects. Force False.
           try:
-              ck = torch.load('ckpt_raw.pth', map_location='cpu')
+              ck = torch.load(path, map_location='cpu', weights_only=False)
+          except TypeError:
+              ck = torch.load(path, map_location='cpu')
           except Exception as e:
-              print('load failed:', e)
-              raise SystemExit(0)
+              print('LOAD FAILED:', type(e).__name__, str(e)[:400])
+              sys.exit(0)
           print('top-level type:', type(ck).__name__)
           if isinstance(ck, dict):
               for k, v in ck.items():
@@ -126,14 +139,22 @@ jobs:
                   sd = ck
                   print('checkpoint is already a raw state_dict')
           if sd is None:
-              print('no model weights found, will keep the original file')
-              raise SystemExit(0)
+              print('NO MODEL KEY FOUND')
+              sys.exit(0)
           total = sum(t.numel() * t.element_size() for t in sd.values() if torch.is_tensor(t))
           print('model-only payload: %.2f GB' % (total / 1e9))
           torch.save({'model': sd}, 'ckpt_model_only.pth')
+          print('WROTE ckpt_model_only.pth')
           PY
-          python slim.py || true
+          python slim.py > slim.log 2>&1 || true
+          cat slim.log
           ls -lh ckpt_raw.pth ckpt_model_only.pth 2>/dev/null || true
+          {
+            echo 'SLIM_DIAG<<EOF_DIAG'
+            head -c 1200 slim.log
+            echo
+            echo 'EOF_DIAG'
+          } >> "$GITHUB_ENV"
 
       - name: Pick the smaller usable file
         run: |
@@ -165,13 +186,17 @@ jobs:
           tag_name: ckpt-${{ github.run_number }}
           name: ProRes checkpoint run ${{ github.run_number }}
           body: |
-            source file : ${{ env.FINAL_SRC }}
-            final size  : ${{ env.FINAL_BYTES }} bytes
-            raw md5     : ${{ env.RAW_MD5 }}
-            merge       : cat ckpt.pth.part* > checkpoint-49.pth
-            note        : if source file says ckpt_model_only.pth, this archive holds
-                          {"model": state_dict} only, which is exactly what the
-                          official demo scripts load via checkpoint['model'].
+            source file   : ${{ env.FINAL_SRC }}
+            final size    : ${{ env.FINAL_BYTES }} bytes
+            raw md5       : ${{ env.RAW_MD5 }}
+            merge         : cat ckpt.pth.part* > checkpoint-49.pth
+            note          : if FINAL_SRC says ckpt_model_only.pth, this file contains
+                            {"model": state_dict} only, which is exactly what the
+                            official demo scripts load via checkpoint['model'].
+
+            slim log
+            --------
+            ${{ env.SLIM_DIAG }}
           files: |
             ckpt.pth.part*
             parts_md5.txt
@@ -179,24 +204,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 # =============================================================================
-# 跑完之后
+# 跑完之后怎么看
 #
-#   新的 Release（ckpt-3）里应该是 2 个分卷、合计约 1.4 GB，
-#   而不是上一轮的 7 个、4.45 GB。Release 页面会写
-#   "source file : ckpt_model_only.pth"，那就对了。
+#   Release（ckpt-4）里应该只有 2 个分卷、合计约 1.4 GB，
+#   说明区会写：
+#       source file : ckpt_model_only.pth
+#       final size  : 约 1.4e9 bytes
+#       slim log    : selected key: model / model-only payload: X.XX GB
 #
-#   直连慢就拼加速前缀（实测可用）：
-#       https://ghfast.top/ + 原来的完整链接
+#   如果还写 source file : ckpt_raw.pth，看下面 "slim log" 段：
+#     "LOAD FAILED: ..."       加载失败，报错类型会写在那里
+#     "torch import" 报错      torch 没装上
+#     "NO MODEL KEY FOUND"     结构里没有 model 键（会打印实际有哪些键）
 #
+#   下载：直连慢就在链接前拼 https://ghfast.top/
 #   分卷全部丢进：
-#       E:\lunwen\图像复原\11_统一复原专题\03_代码\ProRes-main\ProRes\_ckpt_parts\
+#       E://lunwen//图像复原//11_统一复原专题//03_代码//ProRes-main//ProRes//_ckpt_parts//
 #   然后 cd ProRes && python join_ckpt.py
-#
-# 日志里重点看这三行
-#   "downloaded NNN bytes"            下载成功，NNN 应在 4.4e9 量级
-#   "model-only payload: X.XX GB"     瘦身成功，应在 1.4 左右
-#   "using slimmed model-only checkpoint"
-#
-#   若出现 "using the original full checkpoint"，说明结构没识别出来，
-#   会退回完整文件（仍然可用，只是要下 4.45 GB）。
 # =============================================================================
